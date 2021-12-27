@@ -114,7 +114,7 @@ class Translator(object):
         self.device = torch.device('cuda' if config.USE_CUDA else 'cpu')
 
 
-    def translate_batch(self, src_seq):
+    def translate_batch(self, src_seq, arch_parameters=None):
         ''' Translation work in one batch '''
 
         def get_inst_idx_to_tensor_position_map(inst_idx_list):
@@ -147,7 +147,7 @@ class Translator(object):
 
             return active_src_seq, active_src_enc, active_inst_idx_to_position_map
 
-        def beam_decode_step(inst_dec_beams, len_dec_seq, src_seq, enc_output, inst_idx_to_position_map, n_bm, enc_batch_extend_vocab, extra_zeros, mask_src):
+        def beam_decode_step(inst_dec_beams, len_dec_seq, src_seq, enc_output, inst_idx_to_position_map, n_bm, enc_batch_extend_vocab, extra_zeros, mask_src, arch_parameters=None):
             ''' Decode and update beam status, and then return active beam idx '''
 
             def prepare_beam_dec_seq(inst_dec_beams, len_dec_seq):
@@ -167,7 +167,7 @@ class Translator(object):
                 mask_src = torch.cat([mask_src[0].unsqueeze(0)]*mask_trg.size(0),0)
 
 
-                dec_output, attn_dist = self.model.decoder(self.model.embedding(dec_seq), enc_output, (mask_src,mask_trg))
+                dec_output, attn_dist = self.model.decoder(self.model.embedding(dec_seq), enc_output, (mask_src,mask_trg), arch_parameters)
                 prob = self.model.generator(dec_output,attn_dist,enc_batch_extend_vocab, extra_zeros,1,True)
                 word_prob = prob[:, -1]
                 word_prob = word_prob.view(n_active_inst, n_bm, -1)
@@ -207,7 +207,7 @@ class Translator(object):
             #-- Encode
             enc_batch, enc_padding_mask, enc_lens, enc_batch_extend_vocab, extra_zeros, c_t_1, coverage = get_input_from_batch(src_seq)
             mask_src = enc_batch.data.eq(config.PAD_idx).unsqueeze(1)
-            src_enc = self.model.encoder(self.model.embedding(enc_batch),mask_src)
+            src_enc = self.model.encoder(self.model.embedding(enc_batch),mask_src, arch_parameters)
 
             #-- Repeat data for beam search
             n_bm = self.beam_size
@@ -225,7 +225,7 @@ class Translator(object):
             #-- Decode
             for len_dec_seq in range(1, config.max_dec_step + 1):
 
-                active_inst_idx_list = beam_decode_step(inst_dec_beams, len_dec_seq, src_seq, src_enc, inst_idx_to_position_map, n_bm, enc_batch_extend_vocab, extra_zeros, mask_src)
+                active_inst_idx_list = beam_decode_step(inst_dec_beams, len_dec_seq, src_seq, src_enc, inst_idx_to_position_map, n_bm, enc_batch_extend_vocab, extra_zeros, mask_src, arch_parameters)
 
                 if not active_inst_idx_list:
                     break  # all instances have finished their path to <EOS>

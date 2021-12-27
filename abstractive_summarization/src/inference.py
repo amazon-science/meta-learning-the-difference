@@ -51,7 +51,7 @@ if __name__ == '__main__':
     # loading data
     # it's faster to load data from pre_build data
     logger.info('starting to read dataloader')
-    data_file_name = './dataset/' + args.data_name + '/testloader.pt'
+    data_file_name = './dataset/' + args.data_name + '/AdaptSum300sample/testloader.pt'
     train_loader = load(data_file_name)
 
     # initial tokenizer

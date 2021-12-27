@@ -102,7 +102,7 @@ def data_builder(args):
     else:
         data_loader = DataLoader(dataset=train_set,
                                 batch_size=args.batch_size,
-                                shuffle=False,
+                                shuffle=True, # needed for metalearning validation
                                 collate_fn=train_set.collate_fn)
     save(data_loader, save_path)
 

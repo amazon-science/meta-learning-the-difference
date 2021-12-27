@@ -19,22 +19,36 @@ import seaborn as sns
 import math
 
 
-def do_learning(model, train_iter, val_iter, iterations):
+def do_learning(model, train_iter, val_iter, iterations, arch_parameters=None):
     logger = {str(i): [] for i in range(iterations)}
-    loss, ppl_val, ent_b,bleu_score_b = evaluate(model, val_iter, model_name=config.model,ty="test",verbose=False)
+    loss, ppl_val, ent_b,bleu_score_b = evaluate(model, val_iter, model_name=config.model,ty="test",verbose=False, arch_parameters=arch_parameters)
     logger[str(0)] = [loss, ppl_val, ent_b, bleu_score_b]
     for i in range(1,iterations):
         for j, d in enumerate(train_iter):
-            _, _, _ = model.train_one_batch(d)
+            _, _, _ = model.train_one_batch(d, arch_parameters=arch_parameters)
         if(i in [1,3,5,7,10]):#1,3,5,7,
-            loss, ppl_val, ent_b, bleu_score_b = evaluate(model, val_iter, model_name=config.model,ty="test",verbose=False)
+            loss, ppl_val, ent_b, bleu_score_b = evaluate(model, val_iter, model_name=config.model,ty="test",verbose=False, arch_parameters=arch_parameters)
             logger[str(i)] = [loss, ppl_val, ent_b, bleu_score_b]
     return logger
+
+def get_task_representation(model, data):
+    feature = []
+    for d in data:
+        temp = model.get_encoder_output(d)
+        feature.append(temp)
+    feature = torch.cat(feature)
+    return torch.mean(feature, dim=0, keepdim=True)
+
 
 p = Personas()
 # Build model, optimizer, and set states
 print("Test model",config.model)
 model = Transformer(p.vocab,model_file_path=config.save_path,is_eval=False)
+
+if config.tams:
+    arch_controller = ArchController(inp=300)
+    arch_controller.load_state_dict(torch.load(config.controller_path)['state_dict'])
+    arch_controller = arch_controller.cuda()
 
 fine_tune = []
 iter_per_task = []
@@ -49,7 +63,15 @@ for per in tqdm(tasks):
 
         else:
             train_iter, val_iter = p.get_data_loader(persona=per,batch_size=config.batch_size, split='test', fold=val_dial_index)
-        logger = do_learning(model, train_iter, val_iter, iterations=iterations)
+
+
+        if config.tams:
+            task_representation = get_task_representation(meta_net, train_iter)
+            arch_parameters = arch_controller(task_representation).detach()
+        else:
+            arch_parameters = None
+
+        logger = do_learning(model, train_iter, val_iter, iterations=iterations, arch_parameters=arch_parameters)
         fine_tune.append(logger)
         model.load_state_dict({ name: weights_original[name] for name in weights_original })
 

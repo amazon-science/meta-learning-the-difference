@@ -36,12 +36,17 @@ parser.add_argument("--filter", type=int, default=50)
 #meta
 parser.add_argument("--fix_dialnum_train", action="store_true")
 parser.add_argument("--meta_lr", type=float, default=0.1)
-parser.add_argument("--mate_interation", type=int, default=1)
+parser.add_argument("--meta_iteration", type=int, default=1)
 parser.add_argument("--use_sgd", action="store_true")
 parser.add_argument('--meta_batch_size', type=int, default=1)
 parser.add_argument("--meta_optimizer", type=str, default="sgd")
 parser.add_argument("--load_frompretrain", type=str, default="None")
 parser.add_argument("--k_shot", type=int, default=20)
+
+# New for paper "Meta-Learning the Difference"
+parser.add_argument("--tarp", action='store_true', default=False)
+parser.add_argument("--tams", action='store_true', default=False)
+parser.add_argument("--controller_path", type=str, default='None')
 
 arg = parser.parse_args()
 print(arg)
@@ -108,10 +113,15 @@ act_loss_weight = arg.act_loss_weight
 
 ## Meta-learn
 meta_lr = arg.meta_lr
-meta_iteration = arg.mate_interation
+meta_iteration = arg.meta_iteration
 use_sgd = arg.use_sgd
 meta_batch_size = arg.meta_batch_size
 meta_optimizer = arg.meta_optimizer
 fix_dialnum_train = arg.fix_dialnum_train
 load_frompretrain = arg.load_frompretrain
 k_shot = arg.k_shot
+
+# New for paper "Meta-Learning the Difference"
+tarp = arg.tarp
+tams = arg.tams
+controller_path = arg.controller_path

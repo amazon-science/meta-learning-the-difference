@@ -15,6 +15,17 @@ from tqdm import tqdm
 pp = pprint.PrettyPrinter(indent=1)
 from utils.load_bert import bert_model 
 
+from mltd.tams import Cell
+from mltd.tarp import DyLRLayer, DyLRLinear
+
+# the subset used at the time of our TAMS experiments on this dataset
+PERSONA_CHAT_PRIMITIVES = [
+    'none',
+    'identity',
+    'linear',
+    'conv1d_3x1',
+]
+
 class EncoderLayer(nn.Module):
     """
     Represents one Encoder layer of the Transformer Encoder
@@ -22,7 +33,8 @@ class EncoderLayer(nn.Module):
     NOTE: The layer normalization step has been moved to the input as per latest version of T2T
     """
     def __init__(self, hidden_size, total_key_depth, total_value_depth, filter_size, num_heads,
-                 bias_mask=None, layer_dropout=0.0, attention_dropout=0.0, relu_dropout=0.0):
+                 bias_mask=None, layer_dropout=0.0, attention_dropout=0.0, relu_dropout=0.0,
+                 tarp=False, tams=False):
         """
         Parameters:
             hidden_size: Hidden size
@@ -40,17 +52,26 @@ class EncoderLayer(nn.Module):
         super(EncoderLayer, self).__init__()
         
         self.multi_head_attention = MultiHeadAttention(hidden_size, total_key_depth, total_value_depth, 
-                                                       hidden_size, num_heads, bias_mask, attention_dropout)
+                                                       hidden_size, num_heads, bias_mask, attention_dropout,
+                                                       tarp=tarp)
         
         self.positionwise_feed_forward = PositionwiseFeedForward(hidden_size, filter_size, hidden_size,
                                                                  layer_config='cc', padding = 'both', 
-                                                                 dropout=relu_dropout)
+                                                                 dropout=relu_dropout,
+                                                                 tarp=tarp)
+
+        self.tams = tams
+        if self.tams is False:
+            self.output_feed_forward = OutputFeedForward()
+        else:
+            self.output_feed_forward = SearchFNN()
+
         self.dropout = nn.Dropout(layer_dropout)
         self.layer_norm_mha = LayerNorm(hidden_size)
         self.layer_norm_ffn = LayerNorm(hidden_size)
         # self.layer_norm_end = LayerNorm(hidden_size)
         
-    def forward(self, inputs, mask=None):
+    def forward(self, inputs, mask=None, arch_parameters=None):
         x = inputs
         
         # Layer Normalization
@@ -70,6 +91,11 @@ class EncoderLayer(nn.Module):
         
         # Dropout and residual
         y = self.dropout(x + y)
+
+        if self.tams is False:
+            y = self.output_feed_forward(y)
+        else:
+            y = self.output_feed_forward(y, arch_parameters)
         
         # y = self.layer_norm_end(y)
         return y
@@ -81,7 +107,8 @@ class DecoderLayer(nn.Module):
     NOTE: The layer normalization step has been moved to the input as per latest version of T2T
     """
     def __init__(self, hidden_size, total_key_depth, total_value_depth, filter_size, num_heads,
-                 bias_mask, layer_dropout=0.0, attention_dropout=0.0, relu_dropout=0.0):
+                 bias_mask, layer_dropout=0.0, attention_dropout=0.0, relu_dropout=0.0,
+                 tarp=False, tams=False):
         """
         Parameters:
             hidden_size: Hidden size
@@ -99,14 +126,24 @@ class DecoderLayer(nn.Module):
         super(DecoderLayer, self).__init__()
         
         self.multi_head_attention_dec = MultiHeadAttention(hidden_size, total_key_depth, total_value_depth, 
-                                                       hidden_size, num_heads, bias_mask, attention_dropout)
+                                                       hidden_size, num_heads, bias_mask, attention_dropout,
+                                                       tarp=tarp)
 
         self.multi_head_attention_enc_dec = MultiHeadAttention(hidden_size, total_key_depth, total_value_depth, 
-                                                       hidden_size, num_heads, None, attention_dropout)
+                                                       hidden_size, num_heads, None, attention_dropout,
+                                                       tarp=tarp)
         
         self.positionwise_feed_forward = PositionwiseFeedForward(hidden_size, filter_size, hidden_size,
                                                                  layer_config='cc', padding = 'left', 
-                                                                 dropout=relu_dropout)
+                                                                 dropout=relu_dropout,
+                                                                 tarp=tarp)
+        
+        self.tams = tams
+        if self.tams is False:
+            self.output_feed_forward = OutputFeedForward()
+        else:
+            self.output_feed_forward = SearchFNN()
+
         self.dropout = nn.Dropout(layer_dropout)
         self.layer_norm_mha_dec = LayerNorm(hidden_size)
         self.layer_norm_mha_enc = LayerNorm(hidden_size)
@@ -119,7 +156,7 @@ class DecoderLayer(nn.Module):
         NOTE: Inputs is a tuple consisting of decoder inputs and encoder output
         """
 
-        x, encoder_outputs, attention_weight, mask = inputs
+        x, encoder_outputs, attention_weight, mask, arch_parameters = inputs
         mask_src, dec_mask = mask
         
         # Layer Normalization before decoder self attention
@@ -148,11 +185,16 @@ class DecoderLayer(nn.Module):
         
         # Dropout and residual after positionwise feed forward layer
         y = self.dropout(x + y)
+
+        if self.tams is False:
+            y = self.output_feed_forward(y)
+        else:
+            y = self.output_feed_forward(y, arch_parameters)
         
         # y = self.layer_norm_end(y)
         
         # Return encoder outputs as well to work with nn.Sequential
-        return y, encoder_outputs, attention_weight, mask
+        return y, encoder_outputs, attention_weight, mask, arch_parameters
 
 
 
@@ -162,7 +204,8 @@ class MultiHeadAttention(nn.Module):
     Refer Figure 2
     """
     def __init__(self, input_depth, total_key_depth, total_value_depth, output_depth, 
-                 num_heads, bias_mask=None, dropout=0.0):
+                 num_heads, bias_mask=None, dropout=0.0,
+                 tarp=False):
         """
         Parameters:
             input_depth: Size of last dimension of input
@@ -188,11 +231,18 @@ class MultiHeadAttention(nn.Module):
         self.bias_mask = bias_mask
         
         # Key and query depth will be same
-        self.query_linear = nn.Linear(input_depth, total_key_depth, bias=False)
-        self.key_linear = nn.Linear(input_depth, total_key_depth, bias=False)
-        self.value_linear = nn.Linear(input_depth, total_value_depth, bias=False)
-        self.output_linear = nn.Linear(total_value_depth, output_depth, bias=False)
-        
+        if tarp is False:
+            self.query_linear = nn.Linear(input_depth, total_key_depth, bias=False)
+            self.key_linear = nn.Linear(input_depth, total_key_depth, bias=False)
+            self.value_linear = nn.Linear(input_depth, total_value_depth, bias=False)
+            self.output_linear = nn.Linear(total_value_depth, output_depth, bias=False)
+        else:
+            # the flags are because our defaults now differ from what we used on this dataset
+            self.query_linear = DyLRLinear(input_depth, total_key_depth, rank=4)
+            self.key_linear = DyLRLinear(input_depth, total_key_depth, rank=4)
+            self.value_linear = DyLRLinear(input_depth, total_value_depth, rank=4)
+            self.output_linear = DyLRLinear(total_value_depth, output_depth, rank=4)
+
         self.dropout = nn.Dropout(dropout)
     
     def _split_heads(self, x):
@@ -295,12 +345,12 @@ class Conv(nn.Module):
 
         return outputs
 
-
 class PositionwiseFeedForward(nn.Module):
     """
     Does a Linear + RELU + Linear on each of the timesteps
     """
-    def __init__(self, input_depth, filter_size, output_depth, layer_config='ll', padding='left', dropout=0.0):
+    def __init__(self, input_depth, filter_size, output_depth, layer_config='ll', padding='left', dropout=0.0,
+        tarp=False):
         """
         Parameters:
             input_depth: Size of last dimension of input
@@ -323,7 +373,11 @@ class PositionwiseFeedForward(nn.Module):
             if lc == 'l':
                 layers.append(nn.Linear(*s))
             elif lc == 'c':
-                layers.append(Conv(*s, kernel_size=3, pad_type=padding))
+                # layers.append(Conv(*s, kernel_size=3, pad_type=padding))
+                if tarp is False:
+                    layers.append(Conv(*s, kernel_size=3, pad_type=padding))
+                else:
+                    layers.append(LRConv(*s, kernel_size=3, pad_type=padding, rank=4))
             else:
                 raise ValueError("Unknown layer type {}".format(lc))
 
@@ -355,6 +409,68 @@ class LayerNorm(nn.Module):
         mean = x.mean(-1, keepdim=True)
         std = x.std(-1, keepdim=True)
         return self.gamma * (x - mean) / (std + self.eps) + self.beta
+
+
+# task-adaptive low-rank reparameterization modules
+
+class LRConv(nn.Module):
+    def __init__(self, input_size, output_size, kernel_size, pad_type, rank):
+        super(LRConv, self).__init__()
+
+        padding = (kernel_size - 1, 0) if pad_type == 'left' else (kernel_size//2, (kernel_size - 1)//2)
+        self.pad = nn.ConstantPad1d(padding, 0)
+        self.conv = nn.Conv1d(input_size, output_size, kernel_size=kernel_size, padding=0)
+        self.adapter = DyLRLayer(input_size, output_size, rank)
+        self.rank = rank
+
+    def forward(self, inputs):
+        repara = self.adapter(inputs)
+        inputs = self.pad(inputs.permute(0, 2, 1))
+        outputs = self.conv(inputs).permute(0, 2, 1)
+        return outputs + (1/self.rank) * repara
+
+
+# task-adaptive model structure modules
+
+class OutputFeedForward(nn.Module):
+    """
+    Does a Linear + RELU + Linear on each of the timesteps
+    """
+    def __init__(self):
+        super(OutputFeedForward, self).__init__()
+        nx = 300
+        self.ln = LayerNorm(300)
+        self.project_down = nn.Linear(300, 50)
+        self.relu = nn.ReLU()
+        self.project_up = nn.Linear(50, 300)
+
+    def forward(self, x):
+        x_ = self.ln(x)
+        x_ = self.project_down(x_)
+        x_ = self.relu(x_)
+        x_ = self.project_up(x_)
+        x  = x + x_ #residual connection
+        return x
+
+class SearchFNN(nn.Module):
+  def __init__(self, C=300, steps=3, multiplier=3):
+    super(SearchFNN, self).__init__()
+    self._C = C
+    self._steps = steps
+    self._multiplier = multiplier
+    self.stem = LayerNorm(C)
+    C_prev_prev, C_prev, C_curr = C, C, 50
+    self.cell = Cell(steps, multiplier, C_prev_prev, C_prev, C_curr, primitives=PERSONA_CHAT_PRIMITIVES)
+    self.final = nn.Linear(50, 300)
+
+  def forward(self, input, alphas):
+    if alphas == 'skip':
+        return input
+    else:
+        s0 = s1 = self.stem(input)
+        s1 = self.cell(s0, s1, alphas)
+        out = self.final(s1)
+        return out + input # residual
 
 
 def _gen_bias_mask(max_length):
@@ -614,7 +730,7 @@ def print_all(dial,ref,hyp_b,max_print):
         if(i>max_print):break
 
 bert = bert_model()
-def evaluate(model, data, model_name='trs', ty='valid', writer=None, n_iter=0, ty_eval="before", verbose=False ):
+def evaluate(model, data, model_name='trs', ty='valid', writer=None, n_iter=0, ty_eval="before", verbose=False, arch_parameters=None):
 
     dial,ref, hyp_b= [],[],[]
     t = Translator(model, model.vocab)
@@ -625,12 +741,12 @@ def evaluate(model, data, model_name='trs', ty='valid', writer=None, n_iter=0, t
     
     pbar = tqdm(enumerate(data),total=len(data))
     for j, batch in pbar:
-        loss, ppl, _ = model.train_one_batch(batch, train=False)
+        loss, ppl, _ = model.train_one_batch(batch, train=False, arch_parameters=arch_parameters)
         l.append(loss)
         p.append(ppl)
         if((j<3 and ty != "test") or ty =="test"): 
 
-            sent_b, _ = t.translate_batch(batch)
+            sent_b, _ = t.translate_batch(batch, arch_parameters=arch_parameters)
 
             for i in range(len(batch["target_txt"])):
                 new_words = []

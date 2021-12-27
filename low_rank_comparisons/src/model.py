@@ -78,6 +78,175 @@ class Conv1D(nn.Module):
         return x
 
 
+# -----------------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------------------------------------
+# low-rank reparameterization modules
+
+class LRInternal(nn.Module):
+    def __init__(self, nf, nx, rank):
+        super(LRInternal, self).__init__()
+
+        # scale (init ~ 1)
+        w1 = torch.empty(nx, rank)
+        nn.init.normal_(w1, std=0.02)
+        self.w1 = nn.Parameter(w1, requires_grad=True)
+        w2 = torch.empty(rank, nf)
+        nn.init.normal_(w2, std=0.02)
+        self.w2 = nn.Parameter(w2, requires_grad=True)
+        self.act = nn.Softplus()
+
+        # shift (init ~ 0)
+        w3 = torch.empty(nx, rank)
+        nn.init.normal_(w3, std=0.02)
+        self.w3 = nn.Parameter(w3, requires_grad=True)
+        w4 = torch.empty(rank, nf)
+        nn.init.normal_(w4, std=0.02)
+        self.w4 = nn.Parameter(w4, requires_grad=True)
+
+    def forward(self,):
+        scale = self.act(torch.mm(self.w1, self.w2))
+        shift = torch.mm(self.w3, self.w4)
+        return scale, shift
+
+
+def kron(a, b):
+    siz1 = torch.Size(torch.tensor(a.shape[-2:]) * torch.tensor(b.shape[-2:]))
+    res = a.unsqueeze(-1).unsqueeze(-3) * b.unsqueeze(-2).unsqueeze(-4)
+    siz0 = res.shape[:-4]
+    return res.reshape(siz0 + siz1)
+
+
+class KroneckerInternal(nn.Module):
+    def __init__(self, nf, nx, rank, n=4):
+        super(KroneckerInternal, self).__init__()
+
+        self.n = n
+
+        # scale
+        w1 = torch.empty((n, int(nx/n), rank))
+        nn.init.normal_(w1, std=0.02)
+        self.w1 = nn.Parameter(w1, requires_grad=True)
+        w2 = torch.empty((n, rank, int(nf/n)))
+        nn.init.normal_(w2, std=0.02)
+        self.w2 = nn.Parameter(w2, requires_grad=True)
+        w3 = torch.empty((n, n, n))
+        nn.init.normal_(w3, std=0.02)
+        self.w3 = nn.Parameter(w3, requires_grad=True)
+        self.act = nn.Softplus()
+
+        # shift
+        w4 = torch.empty((n, int(nx/n), rank))
+        nn.init.normal_(w4, std=0.02)
+        self.w4 = nn.Parameter(w4, requires_grad=True)
+        w5 = torch.empty((n, rank, int(nf/n)))
+        nn.init.normal_(w5, std=0.02)
+        self.w5 = nn.Parameter(w5, requires_grad=True)
+        w6 = torch.empty((n, n, n))
+        nn.init.normal_(w6, std=0.02)
+        self.w6 = nn.Parameter(w6, requires_grad=True)
+
+    def forward(self,):
+        scale = self.act(torch.sum(kron(self.w3, torch.bmm(self.w1, self.w2)), dim=0))
+        shift = torch.sum(kron(self.w6, torch.bmm(self.w4, self.w5)), dim=0)
+        return scale, shift
+
+
+class DyLRInternal(nn.Module):
+    def __init__(self, nf, nx, rank):
+        super(DyLRInternal, self).__init__()
+
+        # dynamic branch
+        self.fc1 = nn.Linear(nx, rank**2, bias=False)
+        self.rank = rank
+
+        # scale (init ~ 1)
+        w1 = torch.empty(nx, rank)
+        nn.init.normal_(w1, std=0.02)
+        self.w1 = nn.Parameter(w1, requires_grad=True)
+        w2 = torch.empty(rank, nf)
+        nn.init.normal_(w2, std=0.02)
+        self.w2 = nn.Parameter(w2, requires_grad=True)
+        self.act = nn.Softplus()
+
+        # shift (init ~ 0)
+        w3 = torch.empty(nx, rank)
+        nn.init.normal_(w3, std=0.02)
+        self.w3 = nn.Parameter(w3, requires_grad=True)
+        w4 = torch.empty(rank, nf)
+        nn.init.normal_(w4, std=0.02)
+        self.w4 = nn.Parameter(w4, requires_grad=True)
+
+    def forward(self, x):
+        x = x.view(-1, x.size(-1))
+        attn = self.fc1(x).view(x.shape[0], self.rank, self.rank)
+        # scale
+        scale = self.act(torch.mm(self.w1, self.w2))
+        # shift
+        x = torch.mm(x, self.w3)
+        x = torch.bmm(x.unsqueeze(1), attn).squeeze(1)
+        x = torch.mm(x, self.w4)
+        return scale, x 
+
+
+# For tarp='dynamic', this corresponds to
+# mltd.tarp.DyLRLinear(nf, nx, rank, scale_weight=True)
+
+class LowRankConv1D(nn.Module):
+    def __init__(self, nf, nx, rank=4, tarp='vanilla'):
+        """ Conv1D layer as defined by Radford et al. for OpenAI GPT (and also used in GPT-2)
+            Basically works like a Linear layer but the weights are transposed
+        """
+        super(LowRankConv1D, self).__init__()
+        self.nf = nf
+        w = torch.empty(nx, nf)
+        nn.init.normal_(w, std=0.02)
+        self.weight = nn.Parameter(w)
+        self.bias = nn.Parameter(torch.zeros(nf))
+        self.shift_weights = False
+        self.shift_activations = False
+        if tarp == 'vanilla':
+            self.adapter = LRInternal(nf, nx, rank)
+            self.shift_weights = True
+        elif tarp == 'kronecker':
+            self.adapter = KroneckerInternal(nf, nx, rank)
+            self.shift_weights = True
+        elif tarp == 'dynamic':
+            self.adapter = DyLRInternal(nf, nx, rank)
+            self.shift_activations = True
+
+    def forward(self, x):
+        scale, shift = self.adapter(x)
+        weight = self.weight * scale
+        if self.shift_pre:
+            weight += shift
+        size_out = x.size()[:-1] + (self.nf,)
+        x = torch.addmm(self.bias, x.view(-1, x.size(-1)), weight)
+        if self.shift_activations:
+            x += shift
+        x = x.view(*size_out)
+        return x
+
+
+class Adapter(nn.Module):
+    def __init__(self, config):
+        super(Adapter, self).__init__()
+        nx = config.n_embd
+        self.ln = LayerNorm(nx, eps=config.layer_norm_epsilon)
+        self.project_down = nn.Linear(nx, config.adapter_size)
+        self.relu = nn.ReLU()
+        self.project_up = nn.Linear(config.adapter_size, nx)
+    def forward(self, x):
+        x_ = self.ln(x)
+        x_ = self.project_down(x_)
+        x_ = self.relu(x_)
+        x_ = self.project_up(x_)
+        x  = x + x_ #residual connection
+        return x
+
+
+# -----------------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------------------------------------
+
 class Attention(nn.Module):
     def __init__(self, nx, n_ctx, config, scale=False):
         super(Attention, self).__init__()
@@ -89,8 +258,16 @@ class Attention(nn.Module):
         self.n_head = config.n_head
         self.split_size = n_state
         self.scale = scale
-        self.c_attn = Conv1D(n_state * 3, nx)
-        self.c_proj = Conv1D(n_state, nx)
+
+        # TARP experiments
+        if config.lowrank > 0:
+            # For config.tarp = 'dynamic', this corresponds to
+            # mltd.tarp.DyLRLinear(n_state * 3, nx, config.lowrank, scale_weight=True)
+            self.c_attn = LowRankConv1D(n_state * 3, nx, config.lowrank, config.tarp)
+            self.c_proj = LowRankConv1D(n_state, nx, config.lowrank, config.tarp)
+        else:
+            self.c_attn = Conv1D(n_state * 3, nx)
+            self.c_proj = Conv1D(n_state, nx)
 
         #self.lora_dropout = config.lora_dropout
 
@@ -585,8 +762,15 @@ class MLP(nn.Module):
     def __init__(self, n_state, config):  # in MLP: n_state=3072 (4 * n_embd)
         super(MLP, self).__init__()
         nx = config.n_embd
-        self.c_fc = Conv1D(n_state, nx)
-        self.c_proj = Conv1D(nx, n_state)
+
+        # TARP experiments
+        if config.lowrank > 0:
+            self.c_fc = LowRankConv1D(n_state, nx, config.lowrank, config.tarp)
+            self.c_proj = LowRankConv1D(nx, n_state, config.lowrank, config.tarp)
+        else:
+            self.c_fc = Conv1D(n_state, nx)
+            self.c_proj = Conv1D(nx, n_state)
+
         self.act = gelu
 
     def forward(self, x):
@@ -604,11 +788,21 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(nx, eps=config.layer_norm_epsilon)
         self.mlp = MLP(4 * nx, config)
 
+        # TARP experiments
+        if config.adapter_size > 0:
+            self.adapter_block = Adapter(config)
+        else:
+            self.adapter_block = nn.Identity()
+
     def forward(self, x, layer_past=None, len_past=None):
         a, present = self.attn(self.ln_1(x), layer_past=layer_past, len_past=len_past)
         x = x + a
         m = self.mlp(self.ln_2(x))
         x = x + m
+
+        # TARP experiments
+        x = self.adapter_block(x)
+
         return x, present
 
 
@@ -763,6 +957,10 @@ class GPT2Config(object):
             infix_cursor=2000000,
             meta_mlp_layer = 0,
             meta_inputs = [],
+
+            lowrank = 0,
+            tarp='vanilla',
+            adapter_size=0,
     ):
         self.vocab_size = vocab_size_or_config_json_file
         self.n_ctx = n_ctx
@@ -791,6 +989,10 @@ class GPT2Config(object):
 
         self.meta_mlp_layer = meta_mlp_layer
         self.meta_inputs = meta_inputs
+
+        self.lowrank = lowrank
+        self.tarp = tarp
+        self.adapter_size = adapter_size
 
 
 class GPT2LMModel(nn.Module):

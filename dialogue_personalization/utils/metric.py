@@ -98,11 +98,14 @@ def moses_multi_bleu(hypotheses, references, lowercase=False):
     hypothesis_file.write("\n".join(hypotheses).encode("utf-8"))
     hypothesis_file.write(b"\n")
     hypothesis_file.flush()
-    reference_file = tempfile.NamedTemporaryFile()
+
+    # Workaround for regex bug in multi-bleu.perl
+    reference_file = None
+    while (reference_file is None) or reference_file.name.endswith('gz'):
+      reference_file = tempfile.NamedTemporaryFile()
     reference_file.write("\n".join(references).encode("utf-8"))
     reference_file.write(b"\n")
     reference_file.flush()
-
 
      # Calculate BLEU using multi-bleu script
     with open(hypothesis_file.name, "r") as read_pred:

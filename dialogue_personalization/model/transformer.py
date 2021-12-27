@@ -31,7 +31,8 @@ class Encoder(nn.Module):
     """
     def __init__(self, embedding_size, hidden_size, num_layers, num_heads, total_key_depth, total_value_depth,
                  filter_size, max_length=1000, input_dropout=0.0, layer_dropout=0.0, 
-                 attention_dropout=0.0, relu_dropout=0.0, use_mask=False, universal=False):
+                 attention_dropout=0.0, relu_dropout=0.0, use_mask=False, universal=False,
+                 tarp=False, tams=None):
         """
         Parameters:
             embedding_size: Size of embeddings
@@ -67,7 +68,9 @@ class Encoder(nn.Module):
                  _gen_bias_mask(max_length) if use_mask else None,
                  layer_dropout, 
                  attention_dropout, 
-                 relu_dropout)
+                 relu_dropout,
+                 tarp,
+                 tams)
         
         self.embedding_proj = nn.Linear(embedding_size, hidden_size, bias=False)
         if(self.universal):
@@ -83,7 +86,7 @@ class Encoder(nn.Module):
             self.remainders = None
             self.n_updates = None
 
-    def forward(self, inputs, mask):
+    def forward(self, inputs, mask, arch_parameters=None):
         #Add input dropout
         x = self.input_dropout(inputs)
         
@@ -105,7 +108,7 @@ class Encoder(nn.Module):
             x += self.timing_signal[:, :inputs.shape[1], :].type_as(inputs.data)
             
             for i in range(self.num_layers):
-                x = self.enc[i](x, mask)
+                x = self.enc[i](x, mask, arch_parameters)
         
             y = self.layer_norm(x)
         return y
@@ -119,7 +122,8 @@ class Decoder(nn.Module):
     """
     def __init__(self, embedding_size, hidden_size, num_layers, num_heads, total_key_depth, total_value_depth,
                  filter_size, max_length=config.max_enc_steps, input_dropout=0.0, layer_dropout=0.0, 
-                 attention_dropout=0.0, relu_dropout=0.0, universal=False):
+                 attention_dropout=0.0, relu_dropout=0.0, universal=False,
+                 tarp=False, tams=False):
         """
         Parameters:
             embedding_size: Size of embeddings
@@ -156,7 +160,9 @@ class Decoder(nn.Module):
                  _gen_bias_mask(max_length), # mandatory
                  layer_dropout, 
                  attention_dropout, 
-                 relu_dropout)
+                 relu_dropout,
+                 tarp,
+                 tams)
         
         self.embedding_proj = nn.Linear(embedding_size, hidden_size, bias=False)
         if(self.universal):
@@ -171,7 +177,7 @@ class Decoder(nn.Module):
             self.remainders = None
             self.n_updates = None
 
-    def forward(self, inputs, encoder_output, mask):
+    def forward(self, inputs, encoder_output, mask, arch_parameters=None):
         mask_src, mask_trg = mask
         dec_mask = torch.gt(mask_trg + self.mask[:, :mask_trg.size(-1), :mask_trg.size(-1)], 0)
         #Add input dropout
@@ -195,7 +201,7 @@ class Decoder(nn.Module):
             x += self.timing_signal[:, :inputs.shape[1], :].type_as(inputs.data)
             
             # Run decoder
-            y, _, attn_dist, _ = self.dec((x, encoder_output, [], (mask_src,dec_mask)))
+            y, _, attn_dist, _, _ = self.dec((x, encoder_output, [], (mask_src,dec_mask), arch_parameters))
 
             # Final layer normalization
             y = self.layer_norm(y)
@@ -209,13 +215,16 @@ class Generator(nn.Module):
         self.proj = nn.Linear(d_model, vocab)
         self.p_gen_linear = nn.Linear(config.hidden_dim, 1)
 
-    def forward(self, x, attn_dist=None, enc_batch_extend_vocab=None, extra_zeros=None, temp=1, beam_search=False):
+    def forward(self, x, attn_dist=None, enc_batch_extend_vocab=None, extra_zeros=None, temp=1, beam_search=False,
+        skip_everything=False):
 
         if config.pointer_gen:
             p_gen = self.p_gen_linear(x)
             p_gen = torch.sigmoid(p_gen)
 
         logit = self.proj(x)
+        if skip_everything:
+            return logit
 
         if config.pointer_gen:
             vocab_dist = F.softmax(logit/temp, dim=2)
@@ -242,11 +251,13 @@ class Transformer(nn.Module):
         self.embedding = share_embedding(self.vocab,config.preptrained)
         self.encoder = Encoder(config.emb_dim, config.hidden_dim, num_layers=config.hop, num_heads=config.heads, 
                                 total_key_depth=config.depth, total_value_depth=config.depth,
-                                filter_size=config.filter,universal=config.universal)
+                                filter_size=config.filter,universal=config.universal,
+                                tarp=config.tarp, tams=config.tams)
             
         self.decoder = Decoder(config.emb_dim, config.hidden_dim, num_layers=config.hop, num_heads=config.heads, 
                                 total_key_depth=config.depth,total_value_depth=config.depth,
-                                filter_size=config.filter,universal=config.universal)
+                                filter_size=config.filter,universal=config.universal,
+                                tarp=config.tarp, tams=config.tams)
         self.generator = Generator(config.hidden_dim,self.vocab_size)
 
         if config.weight_sharing:
@@ -257,26 +268,35 @@ class Transformer(nn.Module):
         if (config.label_smoothing):
             self.criterion = LabelSmoothing(size=self.vocab_size, padding_idx=config.PAD_idx, smoothing=0.1)
             self.criterion_ppl = nn.NLLLoss(ignore_index=config.PAD_idx)
+        
         if is_eval:
             self.encoder = self.encoder.eval()
             self.decoder = self.decoder.eval()
             self.generator = self.generator.eval()
             self.embedding = self.embedding.eval()
 
-    
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=config.lr)
-        if(config.noam):
-            self.optimizer = NoamOpt(config.hidden_dim, 1, 4000, torch.optim.Adam(self.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))
+        # optimizer
+        if config.tarp:
+            print('===> Optimizing task-adaptive reparameterization (TARP) and architecture-searched (via TAMS) parameters only')
+            selected_parameters = [p for n, p in self.named_parameters() if "adapter" in str(n)] + [p for n, p in self.named_parameters() if "layer_norm" in str(n)] + [p for n, p in self.named_parameters() if "output_feed_forward" in str(n)]
+        else:
+            selected_parameters = self.parameters()
+
         if config.use_sgd:
-            self.optimizer = torch.optim.SGD(self.parameters(), lr=config.lr)
+            self.optimizer = torch.optim.SGD(selected_parameters, lr=config.lr)
+        elif config.noam:
+            self.optimizer = NoamOpt(config.hidden_dim, 1, 4000, torch.optim.Adam(selected_parameters, lr=0, betas=(0.9, 0.98), eps=1e-9))
+        else:
+            self.optimizer = torch.optim.Adam(selected_parameters, lr=config.lr)
+
         if model_file_path is not None:
             print("loading weights")
             state = torch.load(model_file_path, map_location= lambda storage, location: storage)
             print("LOSS",state['current_loss'])
-            self.encoder.load_state_dict(state['encoder_state_dict'])
-            self.decoder.load_state_dict(state['decoder_state_dict'])
-            self.generator.load_state_dict(state['generator_dict'])
-            self.embedding.load_state_dict(state['embedding_dict'])
+            self.encoder.load_state_dict(state['encoder_state_dict'], strict=False)
+            self.decoder.load_state_dict(state['decoder_state_dict'], strict=False)
+            self.generator.load_state_dict(state['generator_dict'], strict=False)
+            self.embedding.load_state_dict(state['embedding_dict'], strict=False)
             if (load_optim):
                 self.optimizer.load_state_dict(state['optimizer'])
 
@@ -286,6 +306,7 @@ class Transformer(nn.Module):
             self.generator = self.generator.cuda()
             self.criterion = self.criterion.cuda()
             self.embedding = self.embedding.cuda()
+
         self.model_dir = config.save_path
         if not os.path.exists(self.model_dir):
             os.makedirs(self.model_dir)
@@ -305,7 +326,7 @@ class Transformer(nn.Module):
         self.best_path = model_save_path
         torch.save(state, model_save_path)
 
-    def train_one_batch(self, batch, train=True):
+    def train_one_batch(self, batch, train=True, arch_parameters=None):
         ## pad and other stuff
         enc_batch, _, _, enc_batch_extend_vocab, extra_zeros, _, _ = get_input_from_batch(batch)
         dec_batch, _, _, _, _ = get_output_from_batch(batch)
@@ -317,7 +338,7 @@ class Transformer(nn.Module):
 
         ## Encode
         mask_src = enc_batch.data.eq(config.PAD_idx).unsqueeze(1)
-        encoder_outputs = self.encoder(self.embedding(enc_batch),mask_src)
+        encoder_outputs = self.encoder(self.embedding(enc_batch),mask_src, arch_parameters)
 
         # Decode 
         sos_token = torch.LongTensor([config.SOS_idx] * enc_batch.size(0)).unsqueeze(1)
@@ -325,7 +346,7 @@ class Transformer(nn.Module):
         dec_batch_shift = torch.cat((sos_token,dec_batch[:, :-1]),1)
 
         mask_trg = dec_batch_shift.data.eq(config.PAD_idx).unsqueeze(1)
-        pre_logit, attn_dist = self.decoder(self.embedding(dec_batch_shift),encoder_outputs, (mask_src,mask_trg))
+        pre_logit, attn_dist = self.decoder(self.embedding(dec_batch_shift),encoder_outputs, (mask_src,mask_trg), arch_parameters)
         ## compute output dist
         logit = self.generator(pre_logit,attn_dist,enc_batch_extend_vocab, extra_zeros)
         
@@ -337,14 +358,67 @@ class Transformer(nn.Module):
             loss+= self.compute_act_loss(self.decoder)
 
         if(train):
-            loss.backward()
+            loss.backward(retain_graph=True)
             self.optimizer.step()
         if(config.label_smoothing): 
             loss = self.criterion_ppl(logit.contiguous().view(-1, logit.size(-1)), dec_batch.contiguous().view(-1))
         
         return loss.item(), math.exp(min(loss.item(), 100)), loss
 
+    def get_encoder_output(self, batch, train=True):
+        ## pad and other stuff
+        enc_batch, _, _, enc_batch_extend_vocab, extra_zeros, _, _ = get_input_from_batch(batch)
+        dec_batch, _, _, _, _ = get_output_from_batch(batch)
 
+        ## Encode
+        mask_src = enc_batch.data.eq(config.PAD_idx).unsqueeze(1)
+        arch_parameters='skip'
+        encoder_outputs = self.encoder(self.embedding(enc_batch),mask_src,arch_parameters)
+        output = encoder_outputs.contiguous().view(-1, encoder_outputs.size(-1)).detach()
+
+        return output
+
+    # def get_prob(self, batch, train=True):
+    #     ## pad and other stuff
+    #     enc_batch, _, _, enc_batch_extend_vocab, extra_zeros, _, _ = get_input_from_batch(batch)
+    #     dec_batch, _, _, _, _ = get_output_from_batch(batch)
+        
+    #     if(config.noam):
+    #         self.optimizer.optimizer.zero_grad()
+    #     else:
+    #         self.optimizer.zero_grad()
+
+    #     ## Encode
+    #     mask_src = enc_batch.data.eq(config.PAD_idx).unsqueeze(1)
+    #     encoder_outputs = self.encoder(self.embedding(enc_batch),mask_src)
+
+    #     # Decode 
+    #     sos_token = torch.LongTensor([config.SOS_idx] * enc_batch.size(0)).unsqueeze(1)
+    #     if config.USE_CUDA: sos_token = sos_token.cuda()
+    #     dec_batch_shift = torch.cat((sos_token,dec_batch[:, :-1]),1)
+
+    #     mask_trg = dec_batch_shift.data.eq(config.PAD_idx).unsqueeze(1)
+    #     pre_logit, attn_dist = self.decoder(self.embedding(dec_batch_shift),encoder_outputs, (mask_src,mask_trg))
+    #     ## compute output dist
+    #     logit = self.generator(pre_logit,attn_dist,enc_batch_extend_vocab, extra_zeros, skip_everything=True)
+        
+    #     return logit.contiguous().view(-1, logit.size(-1))
+
+    # def get_encoder_output(self, batch, train=True)
+    #     ## pad and other stuff
+    #     enc_batch, _, _, enc_batch_extend_vocab, extra_zeros, _, _ = get_input_from_batch(batch)
+    #     dec_batch, _, _, _, _ = get_output_from_batch(batch)
+        
+    #     if(config.noam):
+    #         self.optimizer.optimizer.zero_grad()
+    #     else:
+    #         self.optimizer.zero_grad()
+
+    #     ## Encode
+    #     mask_src = enc_batch.data.eq(config.PAD_idx).unsqueeze(1)
+    #     encoder_outputs = self.encoder(self.embedding(enc_batch),mask_src)
+        
+    #     return encoder_outputs
    
     def compute_act_loss(self,module):    
         R_t = module.remainders

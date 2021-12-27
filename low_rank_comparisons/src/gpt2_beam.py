@@ -83,6 +83,12 @@ parser.add_argument('--prefix_len', default=0, type=int, help='prefix length.')
 
 parser.add_argument('--infix_len', default=0, type=int, help='infix length.')
 
+# New for paper "Meta-Learning the Difference"
+parser.add_argument('--use_distributed', action='store_true', default=False) # restore prev GPU behavior
+parser.add_argument('--adapter_size', default=0, type=int)
+parser.add_argument('--lowrank', type=int, default=0)
+parser.add_argument('--tarp', type=str, default='dynamic', choices=['vanilla', 'kronecker', 'dynamic']help='vanilla, kronecker, or dynamic low-rank matrix decomposition')
+parser.add_argument('--update_ln', action='store_true', default=False) # no effect at decoding
 
 def print_args(args):
     if args.rank == 0:
@@ -242,7 +248,11 @@ def beam(model, data_iter, args):
                 for i in range(0, args.eval_len):
                     if i == 0:
                         logits, past = model(_query) 
-                        logits = logits[_batch, (_query_len-1).long(), :] # batch_size * beam, vocab
+                        if args.use_distributed:
+                            logits = logits[_batch, (_query_len-1).long(), :] # batch_size * beam, vocab
+                        else:
+                            logits = logits[_batch, :, :]
+                            logits = logits[:, (_query_len-1).long(), :]
                     else:
                         #print('token_id.shape', token_id.shape, token_id)
                         #print('past.shape', past[0].shape)
@@ -323,10 +333,13 @@ def beam(model, data_iter, args):
 
 
             with torch.no_grad():
-                _id = distributed_gather(args, _id)
-                output = distributed_gather(args, best_sequence)
-                #score = distributed_gather(args, score)
-                distributed_sync(args)
+                if args.use_distributed:
+                    _id = distributed_gather(args, _id)
+                    output = distributed_gather(args, best_sequence)
+                    #score = distributed_gather(args, score)
+                    distributed_sync(args)
+                else:
+                    output = best_sequence
 
             if args.rank == 0:
                 _id = _id.view(-1).cpu()
@@ -353,27 +366,33 @@ def beam(model, data_iter, args):
 
 if __name__ == '__main__':
     args = parser.parse_args()
-    parse_gpu(args)
+    if args.use_distributed:
+        parse_gpu(args)
+    else:
+        args.device = torch.device('cuda')
     print_args(args)
     
     if args.rank == 0:
         args.logging = create_exp_dir(args.work_dir)
 
     valid_data = FT_Dataset(args.data, args.batch_size, args.seq_len, args.eval_len, prefix_len=args.prefix_len, infix_len=args.infix_len)    
-    valid_sampler = torch.utils.data.distributed.DistributedSampler(valid_data)
+    valid_sampler = None if not args.use_distributed else torch.utils.data.distributed.DistributedSampler(valid_data)
     #print('number of validation samples', valid_data.num_examples, 'number of validation minibatches', valid_data.num_batches, 'total_size', valid_sampler.total_size, 'dataset', len(valid_data))
-    valid_loader = DataLoader(valid_data, batch_size=args.batch_size, num_workers=0, shuffle=False, pin_memory=False, drop_last=False, 
+    valid_loader = DataLoader(valid_data, batch_size=args.batch_size, num_workers=(0 if not args.use_distributed else 8), shuffle=False, pin_memory=(not args.use_distributed), drop_last=False, 
                                                         sampler=valid_sampler)
 
     if args.model_card == 'gpt2.sm':
         config = GPT2Config(n_embd=768, n_layer=12, n_head=12, lora_attn_dim=args.lora_dim, lora_attn_alpha=args.lora_alpha,
-                                                prefix_len=args.prefix_len, infix_len=args.infix_len)
+                                                prefix_len=args.prefix_len, infix_len=args.infix_len,
+                                                lowrank=args.lowrank, tarp=args.tarp, adapter_size=args.adapter_size)
     elif args.model_card == 'gpt2.md':
         config = GPT2Config(n_embd=1024, n_layer=24, n_head=16, lora_attn_dim=args.lora_dim, lora_attn_alpha=args.lora_alpha,
-                                                prefix_len=args.prefix_len, infix_len=args.infix_len)
+                                                prefix_len=args.prefix_len, infix_len=args.infix_len,
+                                                lowrank=args.lowrank, tarp=args.tarp, adapter_size=args.adapter_size)
     elif args.model_card == 'gpt2.lg':
         config = GPT2Config(n_embd=1280, n_layer=36, n_head=20, lora_attn_dim=args.lora_dim, lora_attn_alpha=args.lora_alpha,
-                                                prefix_len=args.prefix_len, infix_len=args.infix_len)
+                                                prefix_len=args.prefix_len, infix_len=args.infix_len,
+                                                lowrank=args.lowrank, tarp=args.tarp, adapter_size=args.adapter_size)
 
     lm_net = GPT2LMModel(config)
     if args.init_checkpoint is not None:
@@ -384,6 +403,8 @@ if __name__ == '__main__':
 
     print('model sampling ...')
     beam(lm_net, valid_loader, args)
-    distributed_sync(args)
-    print('cleanup dist ...')
-    cleanup(args)
+
+    if args.use_distributed:
+        distributed_sync(args)
+        print('cleanup dist ...')
+        cleanup(args)

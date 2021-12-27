@@ -90,6 +90,13 @@ parser.add_argument('--roll_step', type=int, default=100, help='rolling step.')
 
 parser.add_argument('--eval_epoch', type=int, default=1, help='eval per number of epochs.')
 
+# New for paper "Meta-Learning the Difference"
+parser.add_argument('--use_distributed', action='store_true', default=False) # restore prev GPU behavior
+parser.add_argument('--adapter_size', default=0, type=int)
+parser.add_argument('--lowrank', type=int, default=0)
+parser.add_argument('--tarp', type=str, default='dynamic', choices=['vanilla', 'kronecker', 'dynamic']help='vanilla, kronecker, or dynamic low-rank matrix decomposition')
+parser.add_argument('--update_ln', action='store_true', default=False)
+
 
 # influence model, calculate the influence score between two samples.
 def print_args(args):
@@ -176,7 +183,8 @@ def train_validate(model, optimizer, scheduler, train_loader, valid_loader, args
     log_start_time = time.time()
     best_val_ppl = None
 
-    train_loader.sampler.set_epoch(epoch)
+    if args.use_distributed:
+        train_loader.sampler.set_epoch(epoch)
 
     for idx, data in enumerate(train_loader):
         data = {key: value for key, value in data.items()}
@@ -212,7 +220,8 @@ def train_validate(model, optimizer, scheduler, train_loader, valid_loader, args
                 model_path = os.path.join(args.work_dir, 'model.'+str(train_step)+'.pt')
                 print('saving checkpoint', model_path)
                 torch.save({'model_state_dict': model.state_dict()}, model_path)
-            distributed_sync(args)
+            if args.use_distributed:
+                distributed_sync(args)
 
         # evaluation interval
         if train_step % args.eval_interval == 0:
@@ -234,7 +243,8 @@ def train_validate(model, optimizer, scheduler, train_loader, valid_loader, args
                 print('-' * 100)
 
             model.train()
-            distributed_sync(args)
+            if args.use_distributed:
+                distributed_sync(args)
 
         if train_step == args.max_step:
             break
@@ -243,13 +253,15 @@ def train_validate(model, optimizer, scheduler, train_loader, valid_loader, args
         model_path = os.path.join(args.work_dir, 'model.'+str(train_step)+'.pt')
         print('saving checkpoint', model_path)
         torch.save({'model_state_dict': model.state_dict()}, model_path) 
-    distributed_sync(args)
+    if args.use_distributed:
+        distributed_sync(args)
     return train_step
 
 
 if __name__ == '__main__':
     args = parser.parse_args()
-    parse_gpu(args)
+    if args.use_distributed:
+        parse_gpu(args)
     print_args(args)
     
     if args.rank == 0:
@@ -266,34 +278,37 @@ if __name__ == '__main__':
     )
 
     train_loader = DataLoader(
-        train_data, batch_size=args.train_batch_size, num_workers=0, 
-        shuffle=False, pin_memory=False, drop_last=True,
-        sampler=torch.utils.data.distributed.DistributedSampler(train_data, seed=args.random_seed)
+        train_data, batch_size=args.train_batch_size, num_workers=(0 if not args.use_distributed else 8), 
+        shuffle=(not args.use_distributed), pin_memory=(not args.use_distributed), drop_last=True,
+        sampler=(None if not args.use_distributed else torch.utils.data.distributed.DistributedSampler(train_data, seed=args.random_seed))
     )
     
     valid_loader = DataLoader(
-        valid_data, batch_size=args.valid_batch_size, num_workers=0, 
-        shuffle=False, pin_memory=False, drop_last=False,
-        sampler=torch.utils.data.distributed.DistributedSampler(valid_data, seed=args.random_seed)
+        valid_data, batch_size=args.valid_batch_size, num_workers=(0 if not args.use_distributed else 8), 
+        shuffle=False, pin_memory=(not args.use_distributed), drop_last=False,
+        sampler=(None if not args.use_distributed else torch.utils.data.distributed.DistributedSampler(valid_data, seed=args.random_seed))
     )
 
     if args.model_card == 'gpt2.sm':
         config = GPT2Config(
             n_embd=768, n_layer=12, n_head=12, 
             lora_attn_dim=args.lora_dim, lora_attn_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
-            prefix_len=args.prefix_len, infix_len=args.infix_len
+            prefix_len=args.prefix_len, infix_len=args.infix_len,
+            lowrank=args.lowrank, tarp=args.tarp, adapter_size=args.adapter_size
         )
     elif args.model_card == 'gpt2.md':
         config = GPT2Config(
             n_embd=1024, n_layer=24, n_head=16, 
             lora_attn_dim=args.lora_dim, lora_attn_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
-            prefix_len=args.prefix_len, infix_len=args.infix_len
+            prefix_len=args.prefix_len, infix_len=args.infix_len,
+            lowrank=args.lowrank, tarp=args.tarp, adapter_size=args.adapter_size
         )
     elif args.model_card == 'gpt2.lg':
         config = GPT2Config(
             n_embd=1280, n_layer=36, n_head=20, 
             lora_attn_dim=args.lora_dim, lora_attn_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
-            prefix_len=args.prefix_len, infix_len=args.infix_len
+            prefix_len=args.prefix_len, infix_len=args.infix_len,
+            lowrank=args.lowrank, tarp=args.tarp, adapter_size=args.adapter_size
         )
 
     lm_net = GPT2LMModel(config)
@@ -303,9 +318,23 @@ if __name__ == '__main__':
 
     lm_net = lm_net.cuda()
 
-    if args.lora_dim == 0:
+    if args.lora_dim == 0 and args.lowrank == 0 and args.adapter_size == 0:
         optimizer = create_adam_optimizer_from_args(lm_net, args)
         # create_adam_optimizer(lm_net, args.lr, args.weight_decay, correct_bias=True, adam_epislon=1.0e-6, no_decay_bias=args.no_decay_bias)
+    elif args.update_ln:
+        for n, p in lm_net.named_parameters():
+            if 'adapter' in n:
+                print(f'{n}, shape: {p.shape}')
+            elif 'ln' in n:
+                print(f'{n}, shape: {p.shape}')
+            else:
+                p.requires_grad = False
+        optimizer_grouped_parameters = [
+                {
+                    "params": [p for n, p in lm_net.named_parameters() if 'adapter' in n] + [p for n, p in lm_net.named_parameters() if 'ln' in n],
+                }
+        ]
+        optimizer = create_adam_optimizer_from_args(None, args, grouped_parameters=optimizer_grouped_parameters)
     else:
         for n, p in lm_net.named_parameters():
             if 'adapter' in n:
@@ -322,13 +351,17 @@ if __name__ == '__main__':
         #None, args.lr, args.weight_decay, optimizer_grouped_parameters=optimizer_grouped_parameters, correct_bias=True, adam_epislon=1.0e-6)
 
     if args.max_step is None:
-        args.max_step = (args.max_epoch * train_data.num_batches + args.world_size - 1) // args.world_size
+
+        args.max_step = (args.max_epoch * train_data.num_batches + (0 if not args.use_distributed else args.world_size) - 1) // (1 if not args.use_distributed else args.world_size)
         print('set max_step:', args.max_step)
 
     scheduler = create_optimizer_scheduler(optimizer, args)
     if args.fp16:
         lm_net, optimizer = amp.initialize(lm_net, optimizer, opt_level="O1")
-    lm_net, optimizer = distributed_opt(args, lm_net, optimizer, grad_acc=args.grad_acc)
+    if args.use_distributed:
+        lm_net, optimizer = distributed_opt(args, lm_net, optimizer, grad_acc=args.grad_acc)
+    else:
+        lm_net = torch.nn.DataParallel(lm_net)
 
     try:
         train_step = 0
@@ -346,6 +379,7 @@ if __name__ == '__main__':
             print('-' * 100)
             print('Exiting from training early')
 
-    distributed_sync(args)
-    print('cleanup dist ...')
-    cleanup(args)
+    if args.use_distributed:
+        distributed_sync(args)
+        print('cleanup dist ...')
+        cleanup(args)

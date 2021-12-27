@@ -43,11 +43,14 @@ def build_optim(args, model, checkpoint, pretrained_model=None):
         ]
         optim = RecAdam(optimizer_grouped_parameters, lr=args.lr, eps=args.adam_epsilon, anneal_fun=args.anneal_fun, anneal_k=args.anneal_k, anneal_t0=args.anneal_t0, pretrain_cof=args.pretrain_cof)
     else:
+        # stay compatible with pre-existing pretraining scripts
+        tarp = False if ('tarp' not in args) else args.tarp
         optim = Optimizer(
             args.optim, args.lr, args.max_grad_norm,
             beta1=args.beta1, beta2=args.beta2,
             decay_method=args.decay_method,
-            warmup_steps=args.warmup_steps, model_size=args.enc_hidden_size)
+            warmup_steps=args.warmup_steps, model_size=args.enc_hidden_size,
+            tarp=tarp)
 
         optim.set_parameters(list(model.named_parameters()))
 
@@ -104,7 +107,9 @@ class Optimizer(object):
                  adagrad_accum=0.0,
                  decay_method=None,
                  warmup_steps=4000,
-                 model_size=None):
+                 model_size=None,
+                 tarp=False,
+                 t_total=0):
         self.last_ppl = None
         self.learning_rate = learning_rate
         self.original_lr = learning_rate
@@ -120,17 +125,31 @@ class Optimizer(object):
         self.decay_method = decay_method
         self.warmup_steps = warmup_steps
         self.model_size = model_size
+        # New for paper "Meta-Learning the Difference"
+        self.tarp = tarp
+        self.t_total = t_total
 
     def set_parameters(self, params):
         """ ? """
         self.params = []
         self.sparse_params = []
-        for k, p in params:
-            if p.requires_grad:
-                if self.method != 'sparseadam' or "embed" not in k:
-                    self.params.append(p)
-                else:
-                    self.sparse_params.append(p)
+
+        if self.tarp is False:
+            for k, p in params:
+                if p.requires_grad:
+                    if self.method != 'sparseadam' or "embed" not in k:
+                        self.params.append(p)
+                    else:
+                        self.sparse_params.append(p)
+        else:
+            print('===> Optimizing task-adaptive reparameterization (TARP) parameters only')
+            for n, p in params:
+                if p.requires_grad:
+                    if 'layer_norm' in n:
+                        self.params.append(p)
+                    elif 'adapter' in n:
+                        self.params.append(p)
+
         if self.method == 'sgd':
             self.optimizer = optim.SGD(self.params, lr=self.learning_rate)
         elif self.method == 'adagrad':
@@ -152,6 +171,7 @@ class Optimizer(object):
                                   betas=self.betas, eps=1e-8)])
         else:
             raise RuntimeError("Invalid optim method: " + self.method)
+        print(f'===> Use {self.method} optimizer')
 
     def _set_rate(self, learning_rate):
         self.learning_rate = learning_rate
@@ -175,6 +195,15 @@ class Optimizer(object):
                 self.original_lr *
                 ( self.model_size ** -0.5*min(self._step ** (-0.5),
                      self._step * self.warmup_steps**(-1.5))))
+
+        elif self.decay_method == 'linear': # WarmupLinearScheduler
+            if self._step < self.warmup_steps:
+                self._set_rate(self.original_lr * self._step / self.warmup_steps)
+            else:
+                e = self._step - self.warmup_steps
+                es = self.t_total - self.warmup_steps
+                self._set_rate(max(self.original_lr * (1 - e / es), 1e-6))
+
         else:
             if ((self.start_decay_steps is not None) and (
                      self._step >= self.start_decay_steps)):
@@ -189,4 +218,5 @@ class Optimizer(object):
 
         if self.max_grad_norm:
             clip_grad_norm_(self.params, self.max_grad_norm)
+
         self.optimizer.step()
